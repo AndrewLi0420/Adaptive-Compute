@@ -37,11 +37,23 @@ v1 targets macOS on Apple Silicon (PyTorch MPS / CPU). Platform-specific code is
 
 ## Status
 
-Early development. Current milestone: **M1 — System Monitoring** (`adaptive-compute monitor`).
+Early development. M1 (`adaptive-compute monitor`) is done; next up is the responsiveness probe.
+
+```bash
+python3 -m venv venv
+venv/bin/pip install -e ".[dev]"
+venv/bin/adaptive-compute monitor            # live telemetry display
+venv/bin/adaptive-compute monitor --json     # one JSON object per sample
+venv/bin/pytest
+```
+
+The venv directory is deliberately named `venv`, not `.venv`: on this dev machine a
+sync agent sets the macOS `UF_HIDDEN` flag on everything inside dot-directories, and
+Python ≥3.12 silently ignores hidden `.pth` files — which breaks `pip install -e`.
 
 | Milestone | Status |
 |---|---|
-| 1. System monitoring | in progress |
+| 1. System monitoring | done |
 | 2. Responsiveness probe | – |
 | 3. Job runner | – |
 | 4. Pressure model | – |
