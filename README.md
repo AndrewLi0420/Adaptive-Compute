@@ -49,7 +49,8 @@ v1 targets macOS on Apple Silicon (PyTorch MPS / CPU). Platform-specific code is
 
 ## Status
 
-Early development. Monitoring and the responsiveness probe are done; next up is the job runner.
+Early development. Monitoring, the responsiveness probe, and the job runner are done; next up is the
+pressure model. Nothing throttles anything yet — `run` supervises and measures, it does not schedule.
 
 ```bash
 python3 -m venv venv
@@ -57,6 +58,7 @@ venv/bin/pip install -e ".[dev]"
 venv/bin/adaptive-compute monitor            # live telemetry display
 venv/bin/adaptive-compute monitor --json     # one JSON object per sample
 venv/bin/adaptive-compute baseline           # record this machine's idle responsiveness
+venv/bin/adaptive-compute run -- python train.py   # run a command as a managed job
 venv/bin/pytest
 venv/bin/python benchmarks/probe_validation.py   # show the probe responding to load
 ```
@@ -69,7 +71,7 @@ Python ≥3.12 silently ignores hidden `.pth` files — which breaks `pip instal
 |---|---|
 | 1. System monitoring | done |
 | 2. Responsiveness probe | done |
-| 3. Job runner | – |
+| 3. Job runner | done |
 | 4. Pressure model | – |
 | 5. Basic scheduler policies | – |
 | 6. Cooperative SDK | – |

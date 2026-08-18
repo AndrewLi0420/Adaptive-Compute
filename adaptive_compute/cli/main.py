@@ -2,6 +2,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import signal
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,8 @@ from adaptive_compute.monitor import (
 )
 from adaptive_compute.monitor.baseline import BASELINE_PATH
 from adaptive_compute.platform.macos import default_providers
+from adaptive_compute.process import Job, JobManager, JobState
+from adaptive_compute.process.manager import DEFAULT_GRACE_S
 
 
 def _bar(pct: float, width: int = 20) -> str:
@@ -30,14 +33,17 @@ def _fmt_bytes(n: int) -> str:
     return f"{gb:.1f} GB" if gb >= 1 else f"{n / (1024**2):.0f} MB"
 
 
-def render(state: SystemState, baseline: Baseline | None = None) -> str:
+MONITOR_TITLE = "adaptive-compute monitor"
+
+
+def render(state: SystemState, baseline: Baseline | None = None, title: str | None = None) -> str:
     def na(value: object, fmt: str = "{}") -> str:
         return "n/a" if value is None else fmt.format(value)
 
     def na_bytes(value: int | None) -> str:
         return "n/a" if value is None else _fmt_bytes(value)
 
-    lines = ["adaptive-compute monitor", ""]
+    lines = [title, ""] if title else []
 
     if state.cpu_utilization is not None:
         lines.append(f"  CPU     {_bar(state.cpu_utilization)} {state.cpu_utilization:5.1f}%"
@@ -109,7 +115,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(dataclasses.asdict(state)))
         else:
-            print(render(state, baseline))
+            print(render(state, baseline, MONITOR_TITLE))
         return 0
 
     def on_sample(state: SystemState) -> None:
@@ -117,7 +123,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             print(json.dumps(dataclasses.asdict(state)), flush=True)
         else:
             # move cursor home, redraw, clear anything left below
-            sys.stdout.write("\x1b[H" + render(state, baseline) + "\x1b[0J\n")
+            sys.stdout.write("\x1b[H" + render(state, baseline, MONITOR_TITLE) + "\x1b[0J\n")
             sys.stdout.flush()
 
     if not args.json:
@@ -132,6 +138,108 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         if probe is not None:
             probe.stop()
     return 0
+
+
+def render_job(job: Job, state: SystemState | None, baseline: Baseline | None) -> str:
+    elapsed = job.elapsed_s or 0.0
+    lines = [
+        f"adaptive-compute run   {job.name}",
+        "",
+        f"  Job     {job.state.value:<10} pid {job.pid}   elapsed {elapsed:6.0f}s",
+        f"  Logs    {job.job_dir}",
+        "",
+    ]
+    if state is not None:
+        lines.append(render(state, baseline))
+    return "\n".join(lines)
+
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("run: no command given", file=sys.stderr)
+        return 2
+
+    manager = JobManager(command, name=args.name, grace_s=args.grace)
+    baseline = load_baseline()
+
+    # Signal handling: the handler only records intent; all real work happens
+    # in the control loop below, so we never terminate a child from inside a
+    # signal handler. A second Ctrl-C escalates to SIGKILL.
+    shutdown = {"requested": False, "hard": False}
+
+    def on_signal(signum: int, _frame: object) -> None:
+        if shutdown["requested"]:
+            shutdown["hard"] = True
+        shutdown["requested"] = True
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    providers = default_providers(pid=None)  # process provider added after spawn
+    probe = None
+    if args.probe:
+        probe = ResponsivenessProbe()
+
+    try:
+        manager.start()
+        # now that a pid exists, monitor the job's process tree too
+        providers = default_providers(pid=manager.job.pid)
+        if probe is not None:
+            providers.append(probe)
+            probe.start()
+        sampler = Sampler(providers, interval_s=args.interval)
+
+        if not args.quiet:
+            sys.stdout.write("\x1b[2J\x1b[H")
+        state: SystemState | None = None
+        next_sample = time.monotonic()
+        stop_deadline: float | None = None
+
+        while True:
+            # Shutdown is driven from here rather than inside terminate() so a
+            # second interrupt can still escalate during the grace period.
+            if shutdown["hard"]:
+                print("\nsecond interrupt: killing job", file=sys.stderr)
+                manager.kill()
+                break
+            if shutdown["requested"] and stop_deadline is None:
+                print(f"\nstopping job (SIGTERM, {args.grace:.0f}s grace, "
+                      "interrupt again to kill)...", file=sys.stderr)
+                manager.request_terminate()
+                stop_deadline = time.monotonic() + args.grace
+            if manager.poll().is_terminal:
+                break
+            if stop_deadline is not None and time.monotonic() > stop_deadline:
+                print("\ngrace period expired: killing job", file=sys.stderr)
+                manager.kill()
+                break
+
+            now = time.monotonic()
+            if now >= next_sample:
+                next_sample = now + args.interval
+                state = sampler.sample_once()
+                if not args.quiet:
+                    sys.stdout.write(
+                        "\x1b[H" + render_job(manager.job, state, baseline) + "\x1b[0J\n"
+                    )
+                    sys.stdout.flush()
+            # poll the child far more often than we sample, so exit is prompt
+            time.sleep(0.1)
+    finally:
+        if probe is not None:
+            probe.stop()
+        if not manager.job.state.is_terminal:
+            manager.terminate()
+
+    job = manager.job
+    print(f"\n{job.state.value}  exit_code={job.exit_code} signal={job.term_signal} "
+          f"elapsed={job.elapsed_s:.1f}s")
+    print(f"logs: {job.job_dir}")
+    return 0 if job.state is JobState.COMPLETED else 1
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
@@ -184,6 +292,18 @@ def main() -> int:
     monitor.add_argument("--no-probe", dest="probe", action="store_false",
                          help="do not run the responsiveness probe subprocess")
     monitor.set_defaults(func=cmd_monitor)
+
+    run = sub.add_parser("run", help="run a command as a managed job")
+    run.add_argument("--name", default=None, help="job name (default: the program name)")
+    run.add_argument("--interval", type=float, default=1.0, help="telemetry sampling interval")
+    run.add_argument("--grace", type=float, default=DEFAULT_GRACE_S,
+                     help="seconds to wait after SIGTERM before SIGKILL")
+    run.add_argument("--quiet", action="store_true", help="do not draw the live status display")
+    run.add_argument("--no-probe", dest="probe", action="store_false",
+                     help="do not run the responsiveness probe subprocess")
+    run.add_argument("command", nargs=argparse.REMAINDER,
+                     help="the command to run, e.g. -- python train.py")
+    run.set_defaults(func=cmd_run)
 
     baseline = sub.add_parser("baseline", help="record idle responsiveness for this machine")
     baseline.add_argument("--duration", type=float, default=30.0, help="measurement seconds")
