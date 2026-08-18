@@ -110,17 +110,23 @@ def _clamp_fraction(value: float) -> float:
     return max(MIN_COMPUTE_FRACTION, min(MAX_COMPUTE_FRACTION, value))
 
 
-POLICIES = {
-    UnrestrictedPolicy.name: UnrestrictedPolicy,
-    FixedPolicy.name: FixedPolicy,
-    ThresholdPolicy.name: ThresholdPolicy,
-}
-
-
 def build_policy(name: str, fraction: float = 0.5) -> Policy:
+    # Imported here rather than at module scope: the controller builds on the
+    # baselines' targets, so a top-level import would be circular.
+    from adaptive_compute.scheduler.controller import AimdPolicy
+
+    policies: dict[str, type] = {
+        UnrestrictedPolicy.name: UnrestrictedPolicy,
+        FixedPolicy.name: FixedPolicy,
+        ThresholdPolicy.name: ThresholdPolicy,
+        AimdPolicy.name: AimdPolicy,
+    }
     if name == FixedPolicy.name:
         return FixedPolicy(fraction)
     try:
-        return POLICIES[name]()
+        return policies[name]()
     except KeyError:
-        raise ValueError(f"unknown policy {name!r}; choose from {sorted(POLICIES)}") from None
+        raise ValueError(f"unknown policy {name!r}; choose from {sorted(policies)}") from None
+
+
+POLICIES = ("unrestricted", "fixed", "threshold", "aimd")

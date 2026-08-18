@@ -84,8 +84,17 @@ v1 targets macOS on Apple Silicon (PyTorch MPS / CPU). Platform-specific code is
 ## Status
 
 Early development. The end-to-end loop works in both modes — generic (any subprocess, throttled by
-suspension) and cooperative (an instrumented loop that paces itself and reports metrics). Next is a
-smoother feedback controller to replace the step-function budget table.
+suspension) and cooperative (an instrumented loop that paces itself and reports metrics), with three
+baseline policies plus an AIMD controller. Next is the flagship LoRA fine-tuning workload.
+
+**An honest interim finding.** Benchmarking on the development machine (Apple M3) found that CPU duty
+cycling does *not* improve measured interactive responsiveness — throttling a CPU-bound workload
+harder made it slightly worse, while costing up to 12x the throughput. The cause is frequency
+scaling: a continuously running workload keeps the chip clocked high, and a heavily throttled one lets
+it idle down. On this hardware, background CPU contention is not what makes the laptop feel slow, so
+the components with a defensible justification so far are memory protection and thermal backoff. The
+real LoRA workload is the decisive test, and these numbers will be revisited against it rather than
+quietly dropped.
 
 ```bash
 python3 -m venv venv
@@ -111,7 +120,7 @@ Python ≥3.12 silently ignores hidden `.pth` files — which breaks `pip instal
 | 4. Pressure model | done |
 | 5. Basic scheduler policies | done |
 | 6. Cooperative SDK | done |
-| 7. Adaptive controller | – |
+| 7. Adaptive controller | done |
 | 8. LLM fine-tuning demo (LoRA) | – |
 | 9. Dashboard | – |
 | 10. Benchmarking | – |
