@@ -2,6 +2,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -17,11 +18,15 @@ from adaptive_compute.monitor import (
     load_baseline,
     save_baseline,
 )
+from adaptive_compute.config import Config
 from adaptive_compute.monitor.baseline import BASELINE_PATH
 from adaptive_compute.platform.macos import default_providers
-from adaptive_compute.process import Job, JobManager, JobState
+from adaptive_compute.process import JOBS_ROOT, Job, JobManager, JobState
 from adaptive_compute.process.manager import DEFAULT_GRACE_S
+from adaptive_compute.process.throttle import ProcessThrottler
 from adaptive_compute.scheduler import PressureState, PressureTracker
+from adaptive_compute.scheduler.policy import POLICIES, ResourceBudget, build_policy
+from adaptive_compute.telemetry import TelemetryStore
 
 
 def _bar(pct: float, width: int = 20) -> str:
@@ -35,6 +40,10 @@ def _fmt_bytes(n: int) -> str:
 
 
 MONITOR_TITLE = "adaptive-compute monitor"
+
+# Control-loop tick. Bounds duty-cycle resolution and how promptly a shutdown
+# request or child exit is noticed.
+TICK_S = 0.05
 
 
 def render_pressure(pressure: PressureState) -> str:
@@ -157,15 +166,19 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 
 
 def render_job(job: Job, state: SystemState | None, baseline: Baseline | None,
-               pressure: PressureState | None = None) -> str:
+               pressure: PressureState | None = None,
+               budget: ResourceBudget | None = None) -> str:
     elapsed = job.elapsed_s or 0.0
     lines = [
         f"adaptive-compute run   {job.name}",
         "",
         f"  Job     {job.state.value:<10} pid {job.pid}   elapsed {elapsed:6.0f}s",
         f"  Logs    {job.job_dir}",
-        "",
     ]
+    if budget is not None:
+        allowed = "PAUSED" if budget.should_pause else f"{budget.compute_fraction * 100:.0f}%"
+        lines.append(f"  Budget  {_bar(budget.compute_fraction * 100, 10)} {allowed}")
+    lines.append("")
     if state is not None:
         lines.append(render(state, baseline))
     if pressure is not None:
@@ -183,9 +196,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("run: no command given", file=sys.stderr)
         return 2
 
-    manager = JobManager(command, name=args.name, grace_s=args.grace)
+    cfg = Config.load(args.config).merged_with_cli(args)
+    manager = JobManager(command, name=args.name, grace_s=cfg.grace, nice=cfg.nice)
     baseline = load_baseline()
     tracker = PressureTracker(baseline=baseline)
+    policy = build_policy(cfg.policy, cfg.fraction)
+    throttler = ProcessThrottler(manager, period_s=cfg.period)
+    budget = ResourceBudget()
+    store = TelemetryStore() if args.telemetry else None
 
     # Signal handling: the handler only records intent; all real work happens
     # in the control loop below, so we never terminate a child from inside a
@@ -201,9 +219,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, on_signal)
 
     providers = default_providers(pid=None)  # process provider added after spawn
-    probe = None
-    if args.probe:
-        probe = ResponsivenessProbe()
+    probe = ResponsivenessProbe() if cfg.probe else None
 
     try:
         manager.start()
@@ -212,13 +228,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         if probe is not None:
             providers.append(probe)
             probe.start()
-        sampler = Sampler(providers, interval_s=args.interval)
+        sampler = Sampler(providers, interval_s=cfg.interval)
+        if store is not None:
+            store.start_run(policy=policy.name, command=command, job_id=manager.job.id)
 
         if not args.quiet:
             sys.stdout.write("\x1b[2J\x1b[H")
         state: SystemState | None = None
         next_sample = time.monotonic()
         stop_deadline: float | None = None
+        pressure: PressureState | None = None
 
         while True:
             # Shutdown is driven from here rather than inside terminate() so a
@@ -241,29 +260,99 @@ def cmd_run(args: argparse.Namespace) -> int:
 
             now = time.monotonic()
             if now >= next_sample:
-                next_sample = now + args.interval
+                next_sample = now + cfg.interval
                 state = sampler.sample_once()
                 pressure = tracker.update(state)
+                budget = policy.decide(pressure, budget)
+                if store is not None:
+                    store.record_sample(state, pressure, budget, manager.job.state.value)
                 if not args.quiet:
                     sys.stdout.write(
                         "\x1b[H"
-                        + render_job(manager.job, state, baseline, pressure)
+                        + render_job(manager.job, state, baseline, pressure, budget)
                         + "\x1b[0J\n"
                     )
                     sys.stdout.flush()
-            # poll the child far more often than we sample, so exit is prompt
-            time.sleep(0.1)
+
+            # Enforcement runs every tick, far more often than sampling: duty
+            # cycling needs sub-second resolution, while pressure does not.
+            if stop_deadline is None:
+                throttler.apply(budget, time.monotonic())
+            time.sleep(TICK_S)
     finally:
         if probe is not None:
             probe.stop()
         if not manager.job.state.is_terminal:
             manager.terminate()
+        if store is not None:
+            store.finish_run(final_state=manager.job.state.value)
 
     job = manager.job
     print(f"\n{job.state.value}  exit_code={job.exit_code} signal={job.term_signal} "
-          f"elapsed={job.elapsed_s:.1f}s")
+          f"elapsed={job.elapsed_s:.1f}s  policy={policy.name}")
     print(f"logs: {job.job_dir}")
     return 0 if job.state is JobState.COMPLETED else 1
+
+
+def _job_process_status(meta: dict) -> str:
+    pid = meta.get("pid")
+    if pid is None:
+        return "-"
+    try:
+        proc = psutil.Process(pid)
+        status = proc.status()
+    except psutil.NoSuchProcess:
+        return "gone"
+    return "SUSPENDED" if status == psutil.STATUS_STOPPED else status
+
+
+def _load_jobs(root: Path) -> list[dict]:
+    jobs = []
+    for meta_path in sorted(root.glob("*/meta.json")):
+        try:
+            jobs.append(json.loads(meta_path.read_text()))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return jobs
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    jobs = _load_jobs(args.root)
+    if not jobs:
+        print(f"no jobs under {args.root}")
+        return 0
+    print(f"{'job id':<34}{'recorded':<12}{'process':<12}pid")
+    for meta in jobs[-args.limit:]:
+        print(f"{meta['id']:<34}{meta['state']:<12}{_job_process_status(meta):<12}{meta.get('pid')}")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Un-suspend a job orphaned mid-throttle.
+
+    Generic-mode throttling suspends the process group, so a controller killed
+    during a stop phase leaves the job frozen. This is the recovery path.
+    """
+    matches = [m for m in _load_jobs(args.root) if args.job in m["id"]]
+    if not matches:
+        print(f"no job matching {args.job!r}", file=sys.stderr)
+        return 1
+    if len(matches) > 1:
+        print("ambiguous; matches: " + ", ".join(m["id"] for m in matches), file=sys.stderr)
+        return 1
+
+    meta = matches[0]
+    pgid = meta.get("pgid")
+    if pgid is None:
+        print(f"{meta['id']} has no recorded process group", file=sys.stderr)
+        return 1
+    try:
+        os.killpg(pgid, signal.SIGCONT)
+    except ProcessLookupError:
+        print(f"{meta['id']}: process group {pgid} is gone", file=sys.stderr)
+        return 1
+    print(f"sent SIGCONT to process group {pgid} ({meta['id']})")
+    return 0
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
@@ -319,15 +408,36 @@ def main() -> int:
 
     run = sub.add_parser("run", help="run a command as a managed job")
     run.add_argument("--name", default=None, help="job name (default: the program name)")
-    run.add_argument("--interval", type=float, default=1.0, help="telemetry sampling interval")
-    run.add_argument("--grace", type=float, default=DEFAULT_GRACE_S,
+    run.add_argument("--config", type=Path, default=None, help="path to a config file")
+    run.add_argument("--interval", type=float, default=None, help="telemetry sampling interval")
+    run.add_argument("--grace", type=float, default=None,
                      help="seconds to wait after SIGTERM before SIGKILL")
+    run.add_argument("--policy", choices=sorted(POLICIES), default=None,
+                     help="scheduling policy (default: threshold)")
+    run.add_argument("--fraction", type=float, default=None,
+                     help="compute fraction for --policy fixed")
+    run.add_argument("--period", type=float, default=None,
+                     help="duty-cycle period in seconds for generic throttling")
+    run.add_argument("--nice", type=int, default=None,
+                     help="run the job at this nice level (macOS cannot raise it back later)")
     run.add_argument("--quiet", action="store_true", help="do not draw the live status display")
-    run.add_argument("--no-probe", dest="probe", action="store_false",
+    run.add_argument("--no-probe", dest="probe", action="store_false", default=None,
                      help="do not run the responsiveness probe subprocess")
+    run.add_argument("--no-telemetry", dest="telemetry", action="store_false",
+                     help="do not record this run to the telemetry database")
     run.add_argument("command", nargs=argparse.REMAINDER,
                      help="the command to run, e.g. -- python train.py")
     run.set_defaults(func=cmd_run)
+
+    jobs = sub.add_parser("jobs", help="list recent jobs and whether their processes are alive")
+    jobs.add_argument("--root", type=Path, default=JOBS_ROOT, help="jobs directory")
+    jobs.add_argument("--limit", type=int, default=20, help="how many to show")
+    jobs.set_defaults(func=cmd_jobs)
+
+    resume = sub.add_parser("resume", help="resume a job left suspended by a dead controller")
+    resume.add_argument("job", help="job id, or any unique part of it")
+    resume.add_argument("--root", type=Path, default=JOBS_ROOT, help="jobs directory")
+    resume.set_defaults(func=cmd_resume)
 
     baseline = sub.add_parser("baseline", help="record idle responsiveness for this machine")
     baseline.add_argument("--duration", type=float, default=30.0, help="measurement seconds")

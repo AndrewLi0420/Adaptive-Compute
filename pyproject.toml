@@ -5,6 +5,7 @@ description = "Resource-aware local compute runtime for ML workloads"
 requires-python = ">=3.12"
 dependencies = [
     "psutil>=5.9",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

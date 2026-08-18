@@ -33,13 +33,16 @@ class JobManager:
         name: str | None = None,
         root: Path = JOBS_ROOT,
         grace_s: float = DEFAULT_GRACE_S,
+        nice: int = 0,
     ):
         self.job: Job = new_job(command, name, root)
         self.grace_s = grace_s
+        self.nice = nice
         self._proc: subprocess.Popen[bytes] | None = None
         self._stdout: IO[bytes] | None = None
         self._stderr: IO[bytes] | None = None
         self._terminating = False  # did *we* initiate the shutdown?
+        self._suspended = False
         self.job.write_meta()
 
     # -- lifecycle ---------------------------------------------------------
@@ -54,8 +57,14 @@ class JobManager:
         # terminal's Ctrl-C does not reach the child directly (we forward it).
         # Cost: the child has no controlling terminal. Output is redirected to
         # files anyway, which also avoids pipe-buffer deadlocks.
+        # `nice` via the /usr/bin/nice wrapper rather than preexec_fn: forking
+        # with a preexec callback is not safe in a process that has threads,
+        # and this one runs the probe reader thread.
+        argv = self.job.command
+        if self.nice:
+            argv = ["/usr/bin/nice", "-n", str(self.nice), *argv]
         self._proc = subprocess.Popen(
-            self.job.command,
+            argv,
             stdout=self._stdout,
             stderr=self._stderr,
             stdin=subprocess.DEVNULL,
@@ -111,23 +120,41 @@ class JobManager:
 
     # -- control -----------------------------------------------------------
 
-    def pause(self) -> None:
-        """SIGSTOP the process group.
+    def set_suspended(self, suspended: bool) -> None:
+        """SIGSTOP/SIGCONT the group. Idempotent, so it is safe to call every
+        control-loop tick; signals are only sent on a transition.
 
         Coarse and generic-mode only. A stopped process cannot respond to
-        anything, including cleanup, and stopping a process mid-GPU-command
-        is risky — cooperative pause (M6) is the safe path for SDK workloads.
+        anything, including cleanup, and stopping a process mid-GPU-command is
+        risky — cooperative yielding (M6) is the safe path for SDK workloads.
         """
-        if self.job.state is not JobState.RUNNING:
+        if suspended == self._suspended or self.job.state.is_terminal:
             return
-        if self._signal_group(signal.SIGSTOP):
-            self._set_state(JobState.PAUSED)
+        sig = signal.SIGSTOP if suspended else signal.SIGCONT
+        if self._signal_group(sig):
+            self._suspended = suspended
+
+    @property
+    def suspended(self) -> bool:
+        return self._suspended
+
+    def set_state(self, state: JobState) -> None:
+        """Let the scheduler record RUNNING/THROTTLED/PAUSED."""
+        if state.is_terminal:
+            raise ValueError("terminal states are set by the manager, not the caller")
+        self._set_state(state)
+
+    def pause(self) -> None:
+        if self.job.state.is_terminal:
+            return
+        self.set_suspended(True)
+        self._set_state(JobState.PAUSED)
 
     def resume(self) -> None:
-        if self.job.state not in (JobState.PAUSED, JobState.THROTTLED):
+        if self.job.state.is_terminal:
             return
-        if self._signal_group(signal.SIGCONT):
-            self._set_state(JobState.RUNNING)
+        self.set_suspended(False)
+        self._set_state(JobState.RUNNING)
 
     def request_terminate(self) -> None:
         """Send SIGTERM to the group and return immediately.
@@ -139,9 +166,12 @@ class JobManager:
         if self._proc is None or self.job.state.is_terminal:
             return
         self._terminating = True
-        # A stopped process never sees SIGTERM, so wake it first.
-        if self.job.state is JobState.PAUSED:
+        # A stopped process never sees SIGTERM, so wake it first. Keyed on the
+        # suspend flag, not the state: a duty-cycled (THROTTLED) job spends part
+        # of every period stopped too.
+        if self._suspended:
             self._signal_group(signal.SIGCONT)
+            self._suspended = False
         self._signal_group(signal.SIGTERM)
 
     def terminate(self, grace_s: float | None = None) -> JobState:
@@ -187,6 +217,10 @@ class JobManager:
     # -- helpers -----------------------------------------------------------
 
     def _set_state(self, state: JobState) -> None:
+        # Only on change: duty cycling calls this every tick, and rewriting
+        # meta.json tens of times a second would be pointless disk churn.
+        if state is self.job.state:
+            return
         self.job.state = state
         self.job.write_meta()
 
