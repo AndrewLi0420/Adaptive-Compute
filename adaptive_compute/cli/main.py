@@ -21,6 +21,7 @@ from adaptive_compute.monitor.baseline import BASELINE_PATH
 from adaptive_compute.platform.macos import default_providers
 from adaptive_compute.process import Job, JobManager, JobState
 from adaptive_compute.process.manager import DEFAULT_GRACE_S
+from adaptive_compute.scheduler import PressureState, PressureTracker
 
 
 def _bar(pct: float, width: int = 20) -> str:
@@ -34,6 +35,16 @@ def _fmt_bytes(n: int) -> str:
 
 
 MONITOR_TITLE = "adaptive-compute monitor"
+
+
+def render_pressure(pressure: PressureState) -> str:
+    lines = [
+        f"  MODE    {pressure.mode.value:<14} pressure {_bar(pressure.overall * 100, 10)} "
+        f"{pressure.overall:.2f}",
+        "  WHY",
+    ]
+    lines += [f"          • {reason}" for reason in pressure.reasons]
+    return "\n".join(lines)
 
 
 def render(state: SystemState, baseline: Baseline | None = None, title: str | None = None) -> str:
@@ -98,6 +109,7 @@ def render(state: SystemState, baseline: Baseline | None = None, title: str | No
 def cmd_monitor(args: argparse.Namespace) -> int:
     providers = default_providers(pid=args.pid)
     baseline = load_baseline()
+    tracker = PressureTracker(baseline=baseline)
 
     # --once has no sample window to build percentiles from, so the probe is
     # not started at all rather than reporting a meaningless number.
@@ -116,14 +128,18 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             print(json.dumps(dataclasses.asdict(state)))
         else:
             print(render(state, baseline, MONITOR_TITLE))
+            print()
+            print(render_pressure(tracker.update(state)))
         return 0
 
     def on_sample(state: SystemState) -> None:
+        pressure = tracker.update(state)
         if args.json:
             print(json.dumps(dataclasses.asdict(state)), flush=True)
         else:
             # move cursor home, redraw, clear anything left below
-            sys.stdout.write("\x1b[H" + render(state, baseline, MONITOR_TITLE) + "\x1b[0J\n")
+            body = render(state, baseline, MONITOR_TITLE) + "\n\n" + render_pressure(pressure)
+            sys.stdout.write("\x1b[H" + body + "\x1b[0J\n")
             sys.stdout.flush()
 
     if not args.json:
@@ -140,7 +156,8 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
-def render_job(job: Job, state: SystemState | None, baseline: Baseline | None) -> str:
+def render_job(job: Job, state: SystemState | None, baseline: Baseline | None,
+               pressure: PressureState | None = None) -> str:
     elapsed = job.elapsed_s or 0.0
     lines = [
         f"adaptive-compute run   {job.name}",
@@ -151,6 +168,9 @@ def render_job(job: Job, state: SystemState | None, baseline: Baseline | None) -
     ]
     if state is not None:
         lines.append(render(state, baseline))
+    if pressure is not None:
+        lines.append("")
+        lines.append(render_pressure(pressure))
     return "\n".join(lines)
 
 
@@ -165,6 +185,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     manager = JobManager(command, name=args.name, grace_s=args.grace)
     baseline = load_baseline()
+    tracker = PressureTracker(baseline=baseline)
 
     # Signal handling: the handler only records intent; all real work happens
     # in the control loop below, so we never terminate a child from inside a
@@ -222,9 +243,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             if now >= next_sample:
                 next_sample = now + args.interval
                 state = sampler.sample_once()
+                pressure = tracker.update(state)
                 if not args.quiet:
                     sys.stdout.write(
-                        "\x1b[H" + render_job(manager.job, state, baseline) + "\x1b[0J\n"
+                        "\x1b[H"
+                        + render_job(manager.job, state, baseline, pressure)
+                        + "\x1b[0J\n"
                     )
                     sys.stdout.flush()
             # poll the child far more often than we sample, so exit is prompt

@@ -31,6 +31,25 @@ Two modes:
 
 Note on GPU: Adaptive Compute does not directly cap GPU utilization. It controls the duty cycle of cooperative training work to reduce resource contention.
 
+## Reading the machine
+
+Raw telemetry becomes five normalized pressure components — CPU, memory, thermal, user activity, and
+responsiveness — which combine into a mode (IDLE / BACKGROUND / INTERACTIVE / HIGH_PRESSURE /
+CRITICAL) and an explanation:
+
+```
+  MODE    INTERACTIVE    pressure █████░░░░░ 0.50
+  WHY
+          • user active (0s since input) [interactive 0.50]
+          • kernel memory pressure: warn, 3.1 GB available [memory 0.35]
+```
+
+Components combine with `max()`, not a weighted sum: resources are not substitutable, and max keeps
+every decision attributable to one named cause instead of hiding it behind invented weights. CPU
+pressure deliberately excludes the managed job's own usage — a machine busy only with our background
+training is not contended — while memory pressure counts it, because bytes we hold are bytes the
+user's apps cannot have.
+
 ## Measuring responsiveness
 
 "Is the machine usable?" is not "is CPU below X%". Adaptive Compute measures it directly: a tiny
@@ -49,8 +68,9 @@ v1 targets macOS on Apple Silicon (PyTorch MPS / CPU). Platform-specific code is
 
 ## Status
 
-Early development. Monitoring, the responsiveness probe, and the job runner are done; next up is the
-pressure model. Nothing throttles anything yet — `run` supervises and measures, it does not schedule.
+Early development. Monitoring, the responsiveness probe, the job runner, and the pressure model are
+done; next up are the scheduler policies. Nothing throttles anything yet — `run` supervises,
+measures, and explains its assessment, but does not yet act on it.
 
 ```bash
 python3 -m venv venv
@@ -72,7 +92,7 @@ Python ≥3.12 silently ignores hidden `.pth` files — which breaks `pip instal
 | 1. System monitoring | done |
 | 2. Responsiveness probe | done |
 | 3. Job runner | done |
-| 4. Pressure model | – |
+| 4. Pressure model | done |
 | 5. Basic scheduler policies | – |
 | 6. Cooperative SDK | – |
 | 7. Adaptive controller | – |
