@@ -31,20 +31,34 @@ Two modes:
 
 Note on GPU: Adaptive Compute does not directly cap GPU utilization. It controls the duty cycle of cooperative training work to reduce resource contention.
 
+## Measuring responsiveness
+
+"Is the machine usable?" is not "is CPU below X%". Adaptive Compute measures it directly: a tiny
+probe process sends a byte to a partner process and times the round trip. The partner is blocked in
+`read()`, so the kernel has to wake it, schedule it, and let it reply — the same path an input event
+takes to reach an app. Degradation is measured against a recorded per-machine baseline.
+
+On the development machine (Apple M3, 8 cores) the idle p95 is 0.19 ms, and saturating all eight
+cores raises it to 5.2 ms — about 32x. Costs 0.025% of the machine to run. Known limits, measured
+rather than assumed: it does not detect memory-pressure sluggishness (a separate pressure signal
+covers that), and it detects degradation without reliably ranking load levels.
+
 ## Platform
 
 v1 targets macOS on Apple Silicon (PyTorch MPS / CPU). Platform-specific code is isolated so Linux/NVIDIA support can be added later. Single machine only.
 
 ## Status
 
-Early development. M1 (`adaptive-compute monitor`) is done; next up is the responsiveness probe.
+Early development. Monitoring and the responsiveness probe are done; next up is the job runner.
 
 ```bash
 python3 -m venv venv
 venv/bin/pip install -e ".[dev]"
 venv/bin/adaptive-compute monitor            # live telemetry display
 venv/bin/adaptive-compute monitor --json     # one JSON object per sample
+venv/bin/adaptive-compute baseline           # record this machine's idle responsiveness
 venv/bin/pytest
+venv/bin/python benchmarks/probe_validation.py   # show the probe responding to load
 ```
 
 The venv directory is deliberately named `venv`, not `.venv`: on this dev machine a
@@ -54,7 +68,7 @@ Python ≥3.12 silently ignores hidden `.pth` files — which breaks `pip instal
 | Milestone | Status |
 |---|---|
 | 1. System monitoring | done |
-| 2. Responsiveness probe | – |
+| 2. Responsiveness probe | done |
 | 3. Job runner | – |
 | 4. Pressure model | – |
 | 5. Basic scheduler policies | – |

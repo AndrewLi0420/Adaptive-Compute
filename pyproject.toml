@@ -24,3 +24,4 @@ include = ["adaptive_compute*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: takes seconds and touches real system timing"]

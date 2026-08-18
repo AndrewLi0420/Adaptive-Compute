@@ -37,7 +37,11 @@ class SystemState:
 
     gpu_utilization: float | None = None  # best-effort, undocumented source
 
-    responsiveness_latency_ms: float | None = None  # populated in Milestone 2
+    # Responsiveness percentiles over the probe's recent window; the headline
+    # field is p95. Latency = scheduler wakeup delay + small work unit.
+    responsiveness_latency_ms: float | None = None
+    responsiveness_p50_ms: float | None = None
+    responsiveness_p99_ms: float | None = None
 
     monitor_overhead_ms: float | None = None
 
