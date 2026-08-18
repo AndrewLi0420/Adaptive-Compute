@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import IO
 
 from adaptive_compute.process.job import JOBS_ROOT, Job, JobState, new_job
+from adaptive_compute.sdk.channel import JOB_DIR_ENV
 
 log = logging.getLogger(__name__)
 
@@ -63,12 +64,16 @@ class JobManager:
         argv = self.job.command
         if self.nice:
             argv = ["/usr/bin/nice", "-n", str(self.nice), *argv]
+        # The job directory is how a cooperative workload finds its budget file;
+        # scripts without the SDK simply ignore it.
+        env = {**os.environ, JOB_DIR_ENV: str(self.job.job_dir)}
         self._proc = subprocess.Popen(
             argv,
             stdout=self._stdout,
             stderr=self._stderr,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
         self.job.pid = self._proc.pid
         self.job.pgid = os.getpgid(self._proc.pid)

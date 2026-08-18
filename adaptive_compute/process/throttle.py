@@ -72,9 +72,20 @@ class ProcessThrottler:
         self.manager = manager
         self.cycler = DutyCycler(period_s=period_s)
 
-    def apply(self, budget: ResourceBudget, now: float) -> None:
+    def apply(self, budget: ResourceBudget, now: float, cooperative: bool = False) -> None:
         job = self.manager.job
         if job.state.is_terminal:
+            return
+
+        if cooperative:
+            # The workload is pacing itself between compute regions. Suspending
+            # it as well would double-throttle it, and would reintroduce exactly
+            # the mid-GPU-command and frozen-orphan hazards the SDK removes.
+            self.cycler.reset()
+            self.manager.set_suspended(False)
+            self.manager.set_state(
+                JobState.THROTTLED if budget.is_throttled else JobState.RUNNING
+            )
             return
 
         if budget.should_pause:

@@ -26,6 +26,7 @@ from adaptive_compute.process.manager import DEFAULT_GRACE_S
 from adaptive_compute.process.throttle import ProcessThrottler
 from adaptive_compute.scheduler import PressureState, PressureTracker
 from adaptive_compute.scheduler.policy import POLICIES, ResourceBudget, build_policy
+from adaptive_compute.sdk.channel import BudgetPublisher, MetricsTailer, cooperative_is_active
 from adaptive_compute.telemetry import TelemetryStore
 
 
@@ -165,9 +166,24 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
+def render_training(metrics: dict) -> str:
+    parts = []
+    if metrics.get("step") is not None:
+        parts.append(f"step {metrics['step']}")
+    if metrics.get("loss") is not None:
+        parts.append(f"loss {metrics['loss']:.4f}")
+    if metrics.get("tokens_per_s") is not None:
+        parts.append(f"{metrics['tokens_per_s']:.0f} tok/s")
+    if metrics.get("step_time_ms") is not None:
+        parts.append(f"{metrics['step_time_ms']:.0f} ms/step")
+    return "  Train   " + "   ".join(parts) if parts else ""
+
+
 def render_job(job: Job, state: SystemState | None, baseline: Baseline | None,
                pressure: PressureState | None = None,
-               budget: ResourceBudget | None = None) -> str:
+               budget: ResourceBudget | None = None,
+               cooperative: bool = False,
+               training: dict | None = None) -> str:
     elapsed = job.elapsed_s or 0.0
     lines = [
         f"adaptive-compute run   {job.name}",
@@ -177,7 +193,12 @@ def render_job(job: Job, state: SystemState | None, baseline: Baseline | None,
     ]
     if budget is not None:
         allowed = "PAUSED" if budget.should_pause else f"{budget.compute_fraction * 100:.0f}%"
-        lines.append(f"  Budget  {_bar(budget.compute_fraction * 100, 10)} {allowed}")
+        mode = "cooperative" if cooperative else "generic"
+        lines.append(f"  Budget  {_bar(budget.compute_fraction * 100, 10)} {allowed}   ({mode})")
+    if training:
+        line = render_training(training)
+        if line:
+            lines.append(line)
     lines.append("")
     if state is not None:
         lines.append(render(state, baseline))
@@ -204,6 +225,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     throttler = ProcessThrottler(manager, period_s=cfg.period)
     budget = ResourceBudget()
     store = TelemetryStore() if args.telemetry else None
+    publisher = BudgetPublisher(manager.job.job_dir)
+    tailer = MetricsTailer(manager.job.job_dir)
+    training: dict = {}
+    tokens_seen = 0
+    tokens_started: float | None = None
 
     # Signal handling: the handler only records intent; all real work happens
     # in the control loop below, so we never terminate a child from inside a
@@ -222,6 +248,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     probe = ResponsivenessProbe() if cfg.probe else None
 
     try:
+        publisher.publish(budget.compute_fraction, budget.should_pause)
         manager.start()
         # now that a pid exists, monitor the job's process tree too
         providers = default_providers(pid=manager.job.pid)
@@ -238,6 +265,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         next_sample = time.monotonic()
         stop_deadline: float | None = None
         pressure: PressureState | None = None
+        cooperative = False
 
         while True:
             # Shutdown is driven from here rather than inside terminate() so a
@@ -264,12 +292,35 @@ def cmd_run(args: argparse.Namespace) -> int:
                 state = sampler.sample_once()
                 pressure = tracker.update(state)
                 budget = policy.decide(pressure, budget)
+                publisher.publish(
+                    budget.compute_fraction, budget.should_pause,
+                    memory_pressure=state.memory_pressure, mode=pressure.mode.value,
+                )
+                cooperative = cooperative_is_active(manager.job.job_dir)
+
+                for record in tailer.read_new():
+                    training.update(record)
+                    if record.get("tokens"):
+                        tokens_seen += int(record["tokens"])
+                        tokens_started = tokens_started or record.get("ts", time.time())
+                        span = max(1e-6, record.get("ts", time.time()) - tokens_started)
+                        training["tokens_per_s"] = tokens_seen / span
+                    if store is not None:
+                        store.record_training_metric(
+                            ts=record.get("ts", time.time()),
+                            step=record.get("step"), loss=record.get("loss"),
+                            tokens=record.get("tokens"),
+                            step_time_ms=record.get("step_time_ms"),
+                            extra={k: v for k, v in record.items() if k not in
+                                   {"ts", "step", "loss", "tokens", "step_time_ms"}} or None,
+                        )
                 if store is not None:
                     store.record_sample(state, pressure, budget, manager.job.state.value)
                 if not args.quiet:
                     sys.stdout.write(
                         "\x1b[H"
-                        + render_job(manager.job, state, baseline, pressure, budget)
+                        + render_job(manager.job, state, baseline, pressure, budget,
+                                     cooperative, training)
                         + "\x1b[0J\n"
                     )
                     sys.stdout.flush()
@@ -277,7 +328,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             # Enforcement runs every tick, far more often than sampling: duty
             # cycling needs sub-second resolution, while pressure does not.
             if stop_deadline is None:
-                throttler.apply(budget, time.monotonic())
+                throttler.apply(budget, time.monotonic(), cooperative=cooperative)
             time.sleep(TICK_S)
     finally:
         if probe is not None:

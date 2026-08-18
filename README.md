@@ -26,8 +26,23 @@ System Monitor → Pressure Model → Adaptive Scheduler → Resource Budget
 
 Two modes:
 
-- **Generic mode** — wraps any subprocess; coarse control (priority, pause/resume).
-- **Cooperative mode** — optional Python SDK (`from adaptive_compute import adaptive`); the training loop yields between compute regions and reports metrics (loss, tokens/sec), enabling fine-grained duty cycling.
+- **Generic mode** — wraps any subprocess; coarse control by suspending and resuming it.
+- **Cooperative mode** — optional Python SDK; the training loop yields between compute regions and
+  reports metrics, so pauses land at safe points instead of mid-GPU-command:
+
+```python
+from adaptive_compute import adaptive
+
+for batch in dataloader:
+    with adaptive.compute():
+        loss = train_step(batch)
+    adaptive.report(step=step, loss=loss.item(), tokens=n)
+```
+
+The SDK is optional and inert outside a managed job, so instrumented scripts still run standalone.
+One caveat measured rather than assumed: a compute fraction is not a throughput fraction. Running
+intermittently is less efficient than running continuously, because the chip stays clocked down — a
+0.25 budget delivers roughly 0.14 of unrestricted throughput.
 
 Note on GPU: Adaptive Compute does not directly cap GPU utilization. It controls the duty cycle of cooperative training work to reduce resource contention.
 
@@ -68,9 +83,9 @@ v1 targets macOS on Apple Silicon (PyTorch MPS / CPU). Platform-specific code is
 
 ## Status
 
-Early development. The end-to-end loop works: Adaptive Compute measures the machine, decides a
-compute budget, and enforces it on a running job. Next is the cooperative SDK, which replaces coarse
-process suspension with training loops that yield at safe points.
+Early development. The end-to-end loop works in both modes — generic (any subprocess, throttled by
+suspension) and cooperative (an instrumented loop that paces itself and reports metrics). Next is a
+smoother feedback controller to replace the step-function budget table.
 
 ```bash
 python3 -m venv venv
@@ -95,7 +110,7 @@ Python ≥3.12 silently ignores hidden `.pth` files — which breaks `pip instal
 | 3. Job runner | done |
 | 4. Pressure model | done |
 | 5. Basic scheduler policies | done |
-| 6. Cooperative SDK | – |
+| 6. Cooperative SDK | done |
 | 7. Adaptive controller | – |
 | 8. LLM fine-tuning demo (LoRA) | – |
 | 9. Dashboard | – |
